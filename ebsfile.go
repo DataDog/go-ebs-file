@@ -3,14 +3,17 @@ package ebsfile
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ebs"
 	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
 type MockEBS struct {
@@ -64,14 +67,17 @@ func NewMockEBS(filePath string, blockSize int32, volumeSize int64) EBSAPI {
 	}
 }
 
+type EC2Client = ec2.Client
 type EBS struct {
 	*ebs.Client
+	*EC2Client
 }
 
 type EBSAPI interface {
 	ListSnapshotBlocks(ctx context.Context, params *ebs.ListSnapshotBlocksInput, optFns ...func(*ebs.Options)) (*ebs.ListSnapshotBlocksOutput, error)
 	GetSnapshotBlock(ctx context.Context, params *ebs.GetSnapshotBlockInput, optFns ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error)
 	WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error)
+	CreateSnapshot(ctx context.Context, params *ec2.CreateSnapshotInput, optFns ...func(*ec2.Options)) (*ec2.CreateSnapshotOutput, error)
 }
 
 func cacheKey(n int64) string {
@@ -104,8 +110,9 @@ func New(option Option) (*EBS, error) {
 		cfg.Region = option.AwsRegion
 	}
 	ebsClient := ebs.NewFromConfig(cfg)
+	ec2Client := ec2.NewFromConfig(cfg)
 
-	return &EBS{ebsClient}, nil
+	return &EBS{ebsClient, ec2Client}, nil
 }
 
 func (e EBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error) {
@@ -124,9 +131,20 @@ func (e EBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBloc
 	return output, table, nil
 }
 
-func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBSAPI) (*io.SectionReader, error) {
+func Open(id string, ctx context.Context, cache Cache[string, []byte], e EBSAPI) (*io.SectionReader, error) {
+	if !strings.HasPrefix(id, "snap-") {
+		createSnapshotOutput, err := e.CreateSnapshot(ctx, &ec2.CreateSnapshotInput{VolumeId: &id})
+		if err != nil {
+			return nil, err
+		}
+		if createSnapshotOutput.SnapshotId == nil {
+			return nil, errors.New("empty id for newly created snapshot")
+		}
+		id = *createSnapshotOutput.SnapshotId
+	}
+
 	input := &ebs.ListSnapshotBlocksInput{
-		SnapshotId: &snapID,
+		SnapshotId: &id,
 	}
 	output, table, err := e.WalkSnapshotBlocks(ctx, input, make(map[int32]string))
 	if err != nil {
@@ -138,7 +156,7 @@ func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBS
 
 	f := &File{
 		size:       *output.VolumeSize,
-		snapshotID: snapID,
+		snapshotID: id,
 		blockSize:  *output.BlockSize,
 		blockTable: table,
 		cache:      cache,
